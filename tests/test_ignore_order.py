@@ -1,6 +1,10 @@
 import pytest
 import re
 import datetime
+import json
+import os
+import subprocess
+import sys
 from unittest import mock
 from deepdiff.helper import number_to_string, CannotCompare
 from deepdiff import DeepDiff
@@ -1465,3 +1469,184 @@ class TestIgnoreOrderNumericTypeChange:
         """The ignore_order=False path must continue to work as before."""
         result = DeepDiff([{"a": 1}], [{"a": 1.0}], ignore_order=False)
         assert "type_changes" in result
+
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Self-contained scripts run in subprocesses with different PYTHONHASHSEED
+# values. Config-audit pipelines run DeepDiff in fresh processes, so the
+# serialized result must be byte-identical no matter how the interpreter
+# happens to randomize hash seeds.
+_LIST_OF_DICTS_SCRIPT = r'''
+import sys
+from deepdiff import DeepDiff
+
+t1 = {
+    "services": [
+        {"name": "web", "port": 80, "tags": ["http", "public"]},
+        {"name": "api", "port": 8080, "tags": ["http", "internal"]},
+        {"name": "db", "port": 5432, "tags": ["tcp"]},
+    ],
+    "features": {"auth": True, "metrics": False},
+}
+t2 = {
+    "services": [
+        {"name": "db", "port": 5433, "tags": ["tcp"]},
+        {"name": "api", "port": 8081, "tags": ["internal", "http"]},
+        {"name": "web", "port": 81, "tags": ["public", "http"]},
+    ],
+    "features": {"metrics": False, "auth": True},
+}
+sys.stdout.write(DeepDiff(t1, t2, ignore_order=True).to_json())
+'''
+
+_SET_SCRIPT = r'''
+import sys
+from deepdiff import DeepDiff
+
+t1 = {"tags": {"alpha", "beta", "gamma", "delta"}}
+t2 = {"tags": {"beta", "gamma", "delta", "epsilon", "zeta"}}
+sys.stdout.write(DeepDiff(t1, t2, ignore_order=True).to_json())
+'''
+
+
+def _run_script_with_hash_seeds(script, seeds):
+    outputs = []
+    for seed in seeds:
+        env = dict(os.environ, PYTHONHASHSEED=str(seed))
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, env=env, cwd=REPO_ROOT,
+        )
+        assert proc.returncode == 0, proc.stderr
+        outputs.append(proc.stdout)
+    return outputs
+
+
+class TestIgnoreOrderDeterminism:
+    """Pin down stable, reproducible ignore_order results for config audit.
+
+    The same inputs must always produce the same report: no extra entries,
+    no missing entries, and byte-identical serialization across runs and
+    across processes.
+    """
+
+    NESTED_T1 = {
+        "services": [
+            {"name": "web", "port": 80, "tags": ["http", "public"],
+             "limits": {"cpu": "500m", "mem": "256Mi"}},
+            {"name": "api", "port": 8080, "tags": ["http", "internal"],
+             "limits": {"cpu": "1", "mem": "512Mi"}},
+            {"name": "db", "port": 5432, "tags": ["tcp"],
+             "limits": {"cpu": "2", "mem": "1Gi"}},
+        ],
+        "features": {"auth": True, "metrics": False},
+    }
+    NESTED_T2 = {
+        "services": [
+            {"name": "db", "port": 5432, "tags": ["tcp"],
+             "limits": {"cpu": "2", "mem": "1Gi"}},
+            {"name": "api", "port": 8080, "tags": ["internal", "http"],
+             "limits": {"cpu": "2", "mem": "512Mi"}},
+            {"name": "web", "port": 80, "tags": ["public", "http"],
+             "limits": {"cpu": "500m", "mem": "256Mi"}},
+        ],
+        "features": {"metrics": False, "auth": True},
+    }
+
+    def test_repeated_runs_produce_byte_identical_json(self):
+        outputs = {
+            DeepDiff(self.NESTED_T1, self.NESTED_T2, ignore_order=True).to_json()
+            for _ in range(5)
+        }
+        assert 1 == len(outputs)
+
+    def test_nested_dict_list_reports_exact_changes(self):
+        """Reordered nested dicts pair by content: exactly one entry, no more, no less."""
+        expected = {'values_changed': {
+            "root['services'][1]['limits']['cpu']": {'new_value': '2', 'old_value': '1'},
+        }}
+        result = DeepDiff(self.NESTED_T1, self.NESTED_T2, ignore_order=True)
+        assert expected == result
+
+    def test_unhashable_items_reordered_yield_empty_diff(self):
+        """Dicts containing unhashable values (sets, nested lists) match by content."""
+        t1 = {"items": [
+            {"name": "a", "tags": {"x", "y"}, "matrix": [[1, 2], [3, 4]]},
+            {"name": "b", "tags": {"z"}, "matrix": [[5]]},
+        ]}
+        t2 = {"items": [
+            {"name": "b", "tags": {"z"}, "matrix": [[5]]},
+            {"name": "a", "tags": {"y", "x"}, "matrix": [[1, 2], [3, 4]]},
+        ]}
+        assert {} == DeepDiff(t1, t2, ignore_order=True)
+
+    def test_unhashable_items_report_exact_paths(self):
+        t1 = {"items": [{"name": "a", "v": 1}, {"name": "b", "v": 2}, {"name": "c", "v": 3}]}
+        t2 = {"items": [{"name": "c", "v": 30}, {"name": "a", "v": 1}, {"name": "b", "v": 20}]}
+        expected = {'values_changed': {
+            "root['items'][2]['v']": {'new_value': 30, 'old_value': 3},
+            "root['items'][1]['v']": {'new_value': 20, 'old_value': 2},
+        }}
+        result = DeepDiff(t1, t2, ignore_order=True)
+        assert expected == result
+        assert {"root['items'][2]['v']", "root['items'][1]['v']"} == result.affected_paths
+
+    def test_exclude_paths_behaves_like_physical_removal(self):
+        """An excluded path must not influence how list items are ordered or paired.
+
+        Excluding root['services'][0]['ts'] must give the same result as
+        deleting that key from both inputs before comparing.
+        """
+        t1 = {"services": [{"name": "web", "ts": 100}, {"name": "api", "ts": 200}]}
+        t2 = {"services": [{"name": "api", "ts": 999}, {"name": "web", "ts": 888}]}
+        result = DeepDiff(t1, t2, ignore_order=True,
+                          exclude_paths=["root['services'][0]['ts']"])
+
+        t1_stripped = {"services": [{"name": "web"}, {"name": "api", "ts": 200}]}
+        t2_stripped = {"services": [{"name": "api", "ts": 999}, {"name": "web"}]}
+        expected = DeepDiff(t1_stripped, t2_stripped, ignore_order=True)
+        assert expected == result
+        assert {'values_changed': {
+            "root['services'][1]['ts']": {'new_value': 999, 'old_value': 200},
+        }} == result
+
+    @pytest.mark.parametrize('exclude_paths', [
+        ["root['services'][0]['ts']", "root['services'][1]['ts']"],
+        ["root['services'][*]['ts']"],
+    ])
+    def test_exclude_paths_noisy_field_is_fully_ignored(self, exclude_paths):
+        """When the only differences are on excluded paths, the diff is empty."""
+        t1 = {"services": [{"name": "web", "ts": 100}, {"name": "api", "ts": 200}]}
+        t2 = {"services": [{"name": "api", "ts": 999}, {"name": "web", "ts": 888}]}
+        assert {} == DeepDiff(t1, t2, ignore_order=True, exclude_paths=exclude_paths)
+
+    def test_exclude_paths_with_real_change_reports_only_real_change(self):
+        t1 = {"services": [
+            {"name": "web", "ts": 100, "port": 80},
+            {"name": "api", "ts": 200, "port": 8080},
+        ]}
+        t2 = {"services": [
+            {"name": "api", "ts": 999, "port": 8080},
+            {"name": "web", "ts": 888, "port": 81},
+        ]}
+        exclude_paths = ["root['services'][0]['ts']", "root['services'][1]['ts']"]
+        expected = {'values_changed': {
+            "root['services'][0]['port']": {'new_value': 81, 'old_value': 80},
+        }}
+        result = DeepDiff(t1, t2, ignore_order=True, exclude_paths=exclude_paths)
+        assert expected == result
+
+    def test_json_output_stable_across_hash_seeds(self):
+        """Regression baselines stay valid: identical bytes in fresh processes."""
+        outputs = _run_script_with_hash_seeds(_LIST_OF_DICTS_SCRIPT, seeds=(0, 1, 2, 42))
+        assert 1 == len(set(outputs)), "to_json() output differs across hash seeds: %r" % (outputs,)
+        parsed = json.loads(outputs[0])
+        assert 3 == len(parsed["values_changed"])
+
+    def test_set_results_stable_across_hash_seeds(self):
+        outputs = _run_script_with_hash_seeds(_SET_SCRIPT, seeds=(0, 1, 2, 42))
+        assert 1 == len(set(outputs)), "to_json() output differs across hash seeds: %r" % (outputs,)
+        parsed = json.loads(outputs[0])
+        assert ["root['tags']['alpha']"] == parsed["set_item_removed"]
+        assert 2 == len(parsed["set_item_added"])
